@@ -9,6 +9,7 @@ from datetime import datetime
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from bs4 import BeautifulSoup
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -51,26 +52,37 @@ class Bitovki24Scraper:
         Args:
             images_dir: Directory to save downloaded images.
         """
-        self.images_dir = images_dir
+        self.images_dir = Path(images_dir)
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
-        self.session = None
+        self.playwright = None
     
     async def initialize(self):
         """Initialize Playwright browser."""
         logger.info("Initializing browser...")
-        playwright = await async_playwright().start()
-        self.browser = await playwright.chromium.launch(headless=True)
-        self.context = await self.browser.new_context()
-        logger.info("Browser initialized")
+        try:
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.launch(headless=True)
+            self.context = await self.browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+            logger.info("✓ Browser initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize browser: {e}")
+            raise
     
     async def close(self):
         """Close browser and cleanup."""
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        logger.info("Browser closed")
+        try:
+            if self.context:
+                await self.context.close()
+            if self.browser:
+                await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
+            logger.info("✓ Browser closed")
+        except Exception as e:
+            logger.warning(f"Error closing browser: {e}")
     
     async def scrape(self) -> List[House]:
         """Scrape all houses from bitovki24.ru.
@@ -83,34 +95,60 @@ class Bitovki24Scraper:
         
         try:
             # Navigate to catalog
-            logger.info(f"Opening {self.BASE_URL}/catalog/")
-            await page.goto(f"{self.BASE_URL}/catalog/", wait_until="networkidle", timeout=60000)
+            catalog_url = f"{self.BASE_URL}/catalog/"
+            logger.info(f"Opening {catalog_url}")
+            
+            try:
+                await page.goto(catalog_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                logger.warning(f"Navigation timeout, continuing anyway: {e}")
+            
+            # Wait for products to load
+            try:
+                await page.wait_for_selector('a[href*="/products/"], .product-link', timeout=10000)
+            except:
+                logger.warning("Product links not found, trying alternative selectors")
             
             # Get all product links
-            links = await page.locator('a.product-link, a[href*="/products/"]').all()
+            links = await page.locator('a[href*="/product"], a.product-link').all()
             logger.info(f"Found {len(links)} product links")
             
-            for idx, link in enumerate(links[:20]):  # Limit to first 20 for MVP
+            if not links:
+                logger.warning("No product links found. The website structure may have changed.")
+                # Try getting all links and filtering
+                all_links = await page.locator('a').all()
+                logger.info(f"Found {len(all_links)} total links on page")
+            
+            for idx, link in enumerate(links[:10]):  # Limit to first 10 for MVP test
                 try:
                     href = await link.get_attribute('href')
                     if not href:
                         continue
                     
                     product_url = href if href.startswith('http') else f"{self.BASE_URL}{href}"
-                    logger.info(f"[{idx + 1}/{min(20, len(links))}] Scraping {product_url}")
+                    
+                    # Skip if not a product URL
+                    if '/product' not in product_url.lower():
+                        continue
+                    
+                    logger.info(f"[{idx + 1}] Scraping: {product_url[:80]}...")
                     
                     house = await self._scrape_product(page, product_url)
                     if house:
                         houses.append(house)
-                        logger.info(f"  ✓ {house.title} ({house.price} RUB)")
+                        logger.info(f"   ✓ {house.title}")
                     
                 except Exception as e:
-                    logger.warning(f"Error scraping product {idx}: {e}")
+                    logger.debug(f"Error scraping product {idx}: {e}")
                     continue
+        
+        except Exception as e:
+            logger.error(f"Error in scrape method: {e}")
         
         finally:
             await page.close()
         
+        logger.info(f"\nScraped {len(houses)} houses total")
         return houses
     
     async def _scrape_product(self, page: Page, url: str) -> Optional[House]:
@@ -124,55 +162,85 @@ class Bitovki24Scraper:
             House object or None.
         """
         try:
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(1)  # Give page time to render
+            
             html = await page.content()
             soup = BeautifulSoup(html, 'html.parser')
             
             # Extract title
-            title_elem = soup.find('h1') or soup.find('h2', class_='product-title')
+            title_elem = soup.find('h1') or soup.find('h2')
             if not title_elem:
-                logger.warning("Could not find title")
+                logger.debug("Could not find title")
                 return None
+            
             title = title_elem.get_text(strip=True)
+            if not title or len(title) < 3:
+                return None
             
             # Extract price
             price = None
-            price_elem = soup.find('span', class_='price') or soup.find('div', class_='price')
+            # Try various price selectors
+            price_elem = soup.find('span', class_=re.compile('price', re.I))
+            if not price_elem:
+                price_elem = soup.find('div', class_=re.compile('price', re.I))
+            if not price_elem:
+                price_elem = soup.find('div', string=re.compile(r'\d+.*РУБ|руб', re.I))
+            
             if price_elem:
                 price_text = price_elem.get_text(strip=True)
-                import re
-                match = re.search(r'\d+\s*\d*', price_text.replace(' ', ''))
-                if match:
+                # Extract numbers
+                price_match = re.search(r'(\d+\s*)*\d+', price_text.replace(' ', '').replace('РУБ', '').replace('руб', ''))
+                if price_match:
                     try:
-                        price = float(match.group().replace(' ', ''))
+                        price_str = price_match.group().replace(' ', '')
+                        price = float(price_str)
                     except:
                         pass
             
             # Extract size
             size = None
-            size_elem = soup.find('span', class_='size') or soup.find('div', class_='dimensions')
+            size_elem = soup.find('span', class_=re.compile('size|dimension', re.I))
+            if not size_elem:
+                size_elem = soup.find('div', class_=re.compile('size|dimension', re.I))
             if size_elem:
                 size = size_elem.get_text(strip=True)
             
             # Extract description
             description = None
-            desc_elem = soup.find('div', class_='description') or soup.find('p', class_='product-description')
+            desc_elem = soup.find('div', class_=re.compile('description|desc', re.I))
+            if not desc_elem:
+                desc_elem = soup.find('p', class_=re.compile('description|desc', re.I))
             if desc_elem:
-                description = desc_elem.get_text(strip=True)[:500]  # First 500 chars
+                description = desc_elem.get_text(strip=True)[:500]
             
             # Extract contact info
             phone = None
             email = None
-            phone_elem = soup.find('a', href=lambda x: x and 'tel:' in x if x else False)
-            if phone_elem:
-                phone = phone_elem.get_text(strip=True)
-            email_elem = soup.find('a', href=lambda x: x and 'mailto:' in x if x else False)
-            if email_elem:
-                email = email_elem.get_text(strip=True)
+            
+            # Try to find phone
+            phone_patterns = [
+                soup.find('a', href=re.compile(r'^tel:', re.I)),
+                soup.find('span', string=re.compile(r'\+?\d{1,3}.*\d{4,}')),
+            ]
+            for elem in phone_patterns:
+                if elem:
+                    phone = elem.get_text(strip=True)
+                    break
+            
+            # Try to find email
+            email_patterns = [
+                soup.find('a', href=re.compile(r'^mailto:', re.I)),
+                soup.find('span', string=re.compile(r'[\w\.-]+@[\w\.-]+\.\w+'))
+            ]
+            for elem in email_patterns:
+                if elem:
+                    email = elem.get_text(strip=True)
+                    break
             
             # Extract insulation info
             insulation = None
-            insul_elem = soup.find('span', class_='insulation')
+            insul_elem = soup.find('span', class_=re.compile('insul', re.I))
             if insul_elem:
                 insulation = insul_elem.get_text(strip=True)
             
@@ -192,7 +260,7 @@ class Bitovki24Scraper:
             )
         
         except Exception as e:
-            logger.error(f"Error scraping product: {e}")
+            logger.debug(f"Error scraping product: {e}")
             return None
     
     async def _download_images(self, page: Page, soup: BeautifulSoup) -> List[Path]:
@@ -207,29 +275,34 @@ class Bitovki24Scraper:
         """
         image_paths: List[Path] = []
         
-        # Find all images
-        img_elements = soup.find_all('img')
-        
-        for idx, img in enumerate(img_elements[:5]):  # Limit to 5 images per product
-            try:
-                img_url = img.get('src') or img.get('data-src')
-                if not img_url:
-                    continue
-                
-                # Make absolute URL
-                if img_url.startswith('/'):
-                    img_url = f"{self.BASE_URL}{img_url}"
-                elif not img_url.startswith('http'):
-                    continue
-                
-                # Download
-                local_path = await self._download_image(page, img_url)
-                if local_path:
-                    image_paths.append(local_path)
+        try:
+            # Find all images
+            img_elements = soup.find_all('img')
+            logger.debug(f"Found {len(img_elements)} img elements")
             
-            except Exception as e:
-                logger.debug(f"Error downloading image {idx}: {e}")
-                continue
+            for idx, img in enumerate(img_elements[:8]):  # Limit to 8 images per product
+                try:
+                    img_url = img.get('src') or img.get('data-src')
+                    if not img_url:
+                        continue
+                    
+                    # Make absolute URL
+                    if img_url.startswith('/'):
+                        img_url = f"{self.BASE_URL}{img_url}"
+                    elif not img_url.startswith('http'):
+                        continue
+                    
+                    # Download
+                    local_path = await self._download_image(page, img_url)
+                    if local_path:
+                        image_paths.append(local_path)
+                
+                except Exception as e:
+                    logger.debug(f"Error downloading image {idx}: {e}")
+                    continue
+        
+        except Exception as e:
+            logger.debug(f"Error in _download_images: {e}")
         
         return image_paths
     
@@ -245,7 +318,9 @@ class Bitovki24Scraper:
         """
         try:
             # Generate filename
-            filename = hashlib.md5(url.encode()).hexdigest() + Path(url).suffix
+            filename = hashlib.md5(url.encode()).hexdigest()
+            ext = Path(url).suffix or '.jpg'
+            filename = filename + ext
             filepath = self.images_dir / filename
             
             # Skip if already downloaded
@@ -253,16 +328,28 @@ class Bitovki24Scraper:
                 return filepath
             
             # Download
-            response = await page.request.get(url, timeout=30000)
-            if response.ok:
-                with open(filepath, 'wb') as f:
-                    f.write(await response.body())
-                logger.debug(f"Downloaded image: {filename}")
-                return filepath
-            else:
-                logger.debug(f"Failed to download image (status {response.status})")
-                return None
+            try:
+                response = await page.request.get(url, timeout=30000)
+                if response.ok:
+                    with open(filepath, 'wb') as f:
+                        f.write(await response.body())
+                    logger.debug(f"Downloaded: {filename}")
+                    return filepath
+            except Exception as e:
+                logger.debug(f"Failed to download via page.request: {e}")
+                # Fallback to requests library
+                try:
+                    import requests
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code == 200:
+                        with open(filepath, 'wb') as f:
+                            f.write(resp.content)
+                        logger.debug(f"Downloaded (fallback): {filename}")
+                        return filepath
+                except Exception as e2:
+                    logger.debug(f"Fallback download also failed: {e2}")
         
         except Exception as e:
-            logger.debug(f"Error downloading image: {e}")
-            return None
+            logger.debug(f"Error downloading image {url}: {e}")
+        
+        return None
